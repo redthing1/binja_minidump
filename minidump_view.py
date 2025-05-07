@@ -4,10 +4,11 @@
 
 import io
 import traceback  # for detailed error logging
+import datetime  # For timestamp conversion
 
 # binary ninja api imports
 from binaryninja import (
-    BinaryView,
+    BinaryView,  # we will inherit from this directly
     SegmentFlag,
     SectionSemantics,
     Symbol,
@@ -15,7 +16,7 @@ from binaryninja import (
     Platform,
     Architecture,
     Endianness,
-    TagType,  # Added for creating custom tags
+    TagType,
     Logger,
 )
 
@@ -27,8 +28,9 @@ try:
 
     # this is the assumed name of the kaitai-generated parser module.
     # please adjust if your generated file has a different name.
-    # ensure this can be found, e.g., by placing windows_minidump.py in the same directory
-    from .windows_minidump import WindowsMinidump
+    from .windows_minidump import (
+        WindowsMinidump,
+    )  # relative import for plugin structure
 except ImportError as e:
     print(
         f"[MinidumpLoader] Error: Kaitai Struct runtime or Minidump parser not found: {e}"
@@ -45,95 +47,139 @@ class MinidumpView(BinaryView):
     a custom binaryview for interpreting windows minidump files.
     it parses the minidump structure, maps memory segments, identifies modules,
     and sets up the binary ninja environment for analysis with rich annotations.
+    this class also handles its own registration and type validation.
     """
 
-    name = "Minidump (Kaitai)"
-    long_name = "Windows Minidump File (Kaitai)"
+    name = "Minidump (Kaitai)"  # short name used in bn for this view type
+    long_name = "Windows Minidump File (Kaitai)"  # longer, more descriptive name
 
     # tag type for marking the crash site
     CRASH_TAG_TYPE_NAME = "Crash Site"
-    CRASH_TAG_ICON = "💥"
+    CRASH_TAG_ICON = "💥"  # an emoji icon for the tag
+
+    # --- BinaryViewType-like methods, now part of MinidumpView ---
+    @classmethod
+    def is_valid_for_data(cls, data: BinaryView) -> bool:
+        """
+        checks if the provided data (raw binaryview) is a valid minidump file.
+        this method is called by binary ninja to determine if this view type
+        can handle the given file.
+
+        args:
+            data: a binaryview object representing the raw file data.
+
+        returns:
+            true if the data is a minidump, false otherwise.
+        """
+        # minidumps must start with "MDMP" (0x504d444d in little endian)
+        if data.length < 4:
+            # file is too short to even contain the magic number
+            return False
+
+        # read the first 4 bytes for the magic signature.
+        # the kaitai ksy defines 'magic1' as 'MDMP'.
+        magic = data.read(0, 4)
+        is_mdmp = magic == b"MDMP"
+
+        if is_mdmp:
+            # using a temporary logger as self.log is not available in a classmethod
+            Logger(0, "Minidump").log_info(
+                "Valid MDMP signature found by MinidumpView."
+            )
+        else:
+            Logger(0, "Minidump").log_warn(
+                f"Invalid MDMP signature: {magic.hex()}. Not a Minidump file."
+            )
+
+        return is_mdmp
 
     def __init__(self, data: BinaryView):
         """
         initializes the minidumpview instance.
+        this is called by binary ninja when a file is opened with this view type
+        after is_valid_for_data returns true.
+
         args:
             data: the parent binaryview, which provides access to the raw file data.
         """
         super().__init__(file_metadata=data.file, parent_view=data)
         self.raw_data: BinaryView = data
-        self.log: Logger = self.create_logger("Minidump")
+        self.log: Logger = self.create_logger(
+            "Minidump"
+        )  # create a tagged logger instance
 
-        self.dmp: WindowsMinidump | None = None
-        self._address_size: int = 8
+        self.dmp: WindowsMinidump | None = None  # will hold the parsed kaitai object
+        self._address_size: int = 8  # default, updated from systeminfo
         self._endianness: Endianness = Endianness.LittleEndian
         self._platform: Platform | None = None
         self._arch: Architecture | None = None
 
-        self._parsed_streams: dict = {}
-        self._memory_protections: dict = {}  # va_start -> minidump_protection_enum
-        self._crash_tag_type: TagType | None = None
+        self._parsed_streams: dict = {}  # caches parsed stream data
+        self._memory_protections: dict = (
+            {}
+        )  # va_start -> minidump_protection_enum (or int if KSY lacks enum)
+        self._crash_tag_type: TagType | None = None  # cached tag type
 
-        # for perform_get_start / perform_get_length
-        self._min_virtual_address: int = 0xFFFFFFFFFFFFFFFF
-        self._max_virtual_address: int = 0
+        self._min_virtual_address: int = 0xFFFFFFFFFFFFFFFF  # tracks min mapped VA
+        self._max_virtual_address: int = 0  # tracks max mapped VA
 
     def init(self) -> bool:
         """
-        main initialization and parsing method.
+        the main initialization and parsing method for the minidump view.
+        this is called by binary ninja after the view object is created and __init__ completes.
+        it orchestrates the parsing of the minidump and the setup of the
+        binary ninja analysis environment.
+
         returns:
-            true if initialization is successful, false otherwise.
+            true if initialization is successful and the view is ready, false otherwise.
         """
         self.log.log_info("Starting Minidump initialization...")
 
         if not self._parse_minidump_with_kaitai():
+            self.log.log_error(
+                "Failed to parse minidump with Kaitai. Aborting initialization."
+            )
             return False
 
-        if not self._extract_header_info():
+        if not self._extract_header_info():  # uses direct self.dmp attributes now
+            self.log.log_error(
+                "Failed to extract or validate header info. Aborting initialization."
+            )
             return False
 
-        self._cache_parsed_streams()
+        self._cache_parsed_streams()  # uses self.dmp.streams and stream_dir_entry.data
 
-        # create tag types used by this loader
         self._crash_tag_type = self._get_or_create_tag_type(
             self.CRASH_TAG_TYPE_NAME, self.CRASH_TAG_ICON
         )
 
-        # process streams that provide foundational info first
+        # process streams in a logical order
+        # IMPORTANT: Ensure WindowsMinidump.StreamTypes matches your Kaitai-generated enum name
         self._process_system_info_stream(
-            self._parsed_streams.get(WindowsMinidump.StreamTypeEnum.system_info_stream)
+            self._parsed_streams.get(WindowsMinidump.StreamTypes.system_info)
         )
         self._process_memory_info_list_stream(
-            self._parsed_streams.get(
-                WindowsMinidump.StreamTypeEnum.memory_info_list_stream
-            )
+            self._parsed_streams.get(WindowsMinidump.StreamTypes.memory_info_list)
         )
-
-        # process streams that define memory layout and modules
-        self._process_memory_segments()  # handles both memory64list and memorylist
+        self._process_memory_segments()  # handles memory_list and memory_64_list
         self._process_module_list_stream(
-            self._parsed_streams.get(WindowsMinidump.StreamTypeEnum.module_list_stream)
+            self._parsed_streams.get(WindowsMinidump.StreamTypes.module_list)
         )
         self._process_unloaded_module_list_stream(
-            self._parsed_streams.get(
-                WindowsMinidump.StreamTypeEnum.unloaded_module_list_stream
-            )
+            self._parsed_streams.get(WindowsMinidump.StreamTypes.unloaded_module_list)
         )
-
-        # process streams with runtime state information
         self._process_thread_list_stream(
-            self._parsed_streams.get(WindowsMinidump.StreamTypeEnum.thread_list_stream)
+            self._parsed_streams.get(WindowsMinidump.StreamTypes.thread_list)
         )
         self._process_exception_stream(
-            self._parsed_streams.get(WindowsMinidump.StreamTypeEnum.exception_stream)
+            self._parsed_streams.get(WindowsMinidump.StreamTypes.exception)
         )
         self._process_handle_data_stream(
-            self._parsed_streams.get(WindowsMinidump.StreamTypeEnum.handle_data_stream)
+            self._parsed_streams.get(WindowsMinidump.StreamTypes.handle_data)
         )
         self._process_misc_info_stream(
-            self._parsed_streams.get(WindowsMinidump.StreamTypeEnum.misc_info_stream)
+            self._parsed_streams.get(WindowsMinidump.StreamTypes.misc_info)
         )
-        # todo: process other streams like CommentStream, ThreadInfoListStream, etc.
 
         self._finalize_view_setup()
 
@@ -141,7 +187,7 @@ class MinidumpView(BinaryView):
         return True
 
     def _parse_minidump_with_kaitai(self) -> bool:
-        """reads the raw file and parses it using the kaitai struct generated parser."""
+        """helper: reads raw file data and parses it using the kaitai struct generated parser."""
         self.log.log_debug("Reading raw file data for Kaitai parsing...")
         try:
             file_bytes = self.raw_data.read(0, self.raw_data.length)
@@ -155,542 +201,713 @@ class MinidumpView(BinaryView):
             return False
 
     def _extract_header_info(self) -> bool:
-        """validates and extracts basic information from the parsed minidump header."""
-        if not self.dmp or not self.dmp.header:
-            self.log.log_error("Kaitai parser did not produce a valid header object.")
-            return False
-
-        header = self.dmp.header
-        # verify signature (kaitai enum name might differ, e.g., WindowsMinidump.Magic.mdmp)
-        # IMPORTANT: Adjust `WindowsMinidump.MagicSignature.minidump` to your actual Kaitai enum.
-        if header.signature != WindowsMinidump.MagicSignature.minidump:
+        """helper: validates and extracts basic info from the parsed minidump header fields."""
+        if not self.dmp:  # ensure dmp object exists
             self.log.log_error(
-                f"Invalid minidump signature after full parse. Expected "
-                f"'{WindowsMinidump.MagicSignature.minidump!r}', got '{header.signature!r}'."
+                "Kaitai parser object (self.dmp) is None. Cannot extract header."
             )
             return False
 
-        num_streams = header.num_streams
-        minidump_flags = header.flags  # type: ignore
-        self.log.log_info(
-            f"Minidump contains {num_streams} streams. Flags: {minidump_flags!r}"
-        )
-        return True
+        # access header fields directly from self.dmp, as per KSY structure
+        try:
+            # KSY defines `magic1` (contents: MDMP) and `magic2` (contents: [0x93, 0xa7])
+            # Kaitai validates these during parsing. If self.dmp exists, these were matched.
+            self.log.log_debug(
+                f"Minidump magic1 (Signature): {self.dmp.magic1!r}"
+            )  # Kaitai usually stores 'contents' as bytes
+            self.log.log_debug(
+                f"Minidump magic2 (Version Bytes): {self.dmp.magic2}"
+            )  # This will be a list of ints
+            self.log.log_debug(
+                f"Minidump version (Implementation Specific): 0x{self.dmp.version:x}"
+            )
+
+            num_streams = self.dmp.num_streams
+            minidump_flags = self.dmp.flags  # This is a u8 in KSY
+            timestamp_raw = self.dmp.timestamp  # u4 in KSY
+
+            try:
+                timestamp_dt = datetime.datetime.fromtimestamp(
+                    timestamp_raw, tz=datetime.timezone.utc
+                )
+                timestamp_str = timestamp_dt.isoformat()
+            except Exception as ts_ex:
+                timestamp_str = f"Invalid raw value 0x{timestamp_raw:x} ({ts_ex})"
+                self.log.log_warn(f"Could not convert timestamp: {ts_ex}")
+
+            self.log.log_info(
+                f"Minidump contains {num_streams} streams. Flags: 0x{minidump_flags:016x}. Timestamp: {timestamp_str} (Raw: 0x{timestamp_raw:x})"
+            )
+            # Checksum is self.dmp.checksum (u4)
+            self.log.log_debug(f"Minidump checksum: 0x{self.dmp.checksum:x}")
+            # Offset to streams is self.dmp.ofs_streams (u4)
+            self.log.log_debug(
+                f"Minidump stream directory RVA: 0x{self.dmp.ofs_streams:x}"
+            )
+
+            return True
+        except AttributeError as e:
+            self.log.log_error(
+                f"Error accessing header field from self.dmp (Kaitai structure might differ): {e}"
+            )
+            self.log.log_error(traceback.format_exc())
+            return False
 
     def _cache_parsed_streams(self):
-        """iterates through the kaitai parsed stream directory and caches stream data by type."""
-        if not self.dmp or not self.dmp.dir_streams:
-            self.log.log_warn("Minidump stream directory is empty or not parsed.")
+        """helper: iterates kaitai parsed stream directory, caches stream data by type."""
+        # KSY: instances: streams: pos: ofs_streams, type: dir, repeat-expr: num_streams
+        # KSY: types: dir: seq: - id: stream_type, type: u4, enum: stream_types
+        #                       - id: len_data, type: u4
+        #                       - id: ofs_data, type: u4
+        #                 instances: data: pos: ofs_data, size: len_data, type: switch-on stream_type
+        if not self.dmp or not hasattr(self.dmp, "streams") or not self.dmp.streams:
+            self.log.log_warn(
+                "Minidump stream directory (self.dmp.streams) is empty or not parsed by Kaitai."
+            )
             return
 
-        self.log.log_debug(f"Caching {len(self.dmp.dir_streams)} streams...")
-        for stream_dir_entry in self.dmp.dir_streams:
-            # IMPORTANT: `stream_dir_entry.body` is an assumption for where Kaitai places
-            # the parsed stream data. Verify with your `windows_minidump.py`.
-            # It might be `stream_dir_entry.data` or another attribute name.
-            if hasattr(stream_dir_entry, "body"):
+        self.log.log_debug(
+            f"Caching {len(self.dmp.streams)} streams from stream directory..."
+        )
+        for stream_dir_entry in self.dmp.streams:
+            # `stream_dir_entry.data` should hold the parsed stream content based on `stream_type`.
+            if hasattr(stream_dir_entry, "data"):
                 self._parsed_streams[stream_dir_entry.stream_type] = (
-                    stream_dir_entry.body
+                    stream_dir_entry.data
                 )
                 self.log.log_debug(f"  Cached stream: {stream_dir_entry.stream_type!r}")
             else:
+                # this case might occur if a stream type is in the directory but not defined in the KSY's switch-case for `dir.data`
                 self.log.log_warn(
-                    f"Stream entry for type {stream_dir_entry.stream_type!r} has no 'body' attribute. Kaitai structure might differ."
+                    f"Stream directory entry for type {stream_dir_entry.stream_type!r} "
+                    f"is missing the 'data' attribute. This stream type might not be fully parsed by the KSY."
                 )
 
     def _process_system_info_stream(self, sys_info_data) -> None:
-        """processes the systeminfo stream to set platform and architecture."""
-        if not sys_info_data:
+        """helper: processes systeminfo stream to set platform and architecture."""
+        if (
+            not sys_info_data
+        ):  # sys_info_data is the parsed content of the SystemInfo stream
             self.log.log_warn(
-                "SystemInfoStream not found. Using default platform settings (may be incorrect)."
+                "SystemInfoStream not found or not parsed. Platform/arch will use defaults."
             )
             return
 
         self.log.log_debug("Processing SystemInfoStream...")
+        # KSY: types: system_info: seq: - id: cpu_arch, enum: cpu_archs
         arch_str, os_str = self._map_system_info_to_platform(sys_info_data)
         if arch_str and os_str:
+            platform_name = f"{os_str}-{arch_str}"
             try:
-                self._platform = Platform[f"{os_str}-{arch_str}"]
+                self._platform = Platform[platform_name]
                 self._arch = self._platform.arch
                 self._address_size = (
                     self._arch.address_size
                     if self._arch
                     else (8 if "64" in arch_str or arch_str == "aarch64" else 4)
                 )
-                self.platform = self._platform  # assign to the binaryview's platform
+                self.platform = (
+                    self._platform
+                )  # Assign to the BinaryView's platform property
                 self.log.log_info(
                     f"Platform set to '{self._platform.name}'. Address Size: {self._address_size} bytes."
                 )
+                # Log other system info
+                self.log.log_info(
+                    f"  OS Version: {sys_info_data.os_ver_major}.{sys_info_data.os_ver_minor} Build {sys_info_data.os_build}"
+                )
+                if (
+                    hasattr(sys_info_data, "service_pack")
+                    and sys_info_data.service_pack
+                ):
+                    self.log.log_info(
+                        f"  Service Pack: {sys_info_data.service_pack.str}"
+                    )
+
             except KeyError:
                 self.log.log_error(
-                    f"Binary Ninja does not support platform '{os_str}-{arch_str}'. Cannot proceed with this platform."
+                    f"Binary Ninja does not have a registered platform named '{platform_name}'. "
+                    f"Minidump analysis will be significantly impaired."
                 )
-                # consider setting a fallback or raising an error to stop loading
+            except AttributeError as e:
+                self.log.log_error(
+                    f"Error accessing attributes in SystemInfo data (Kaitai structure might differ): {e}"
+                )
+
         else:
             self.log.log_warn(
-                "Could not determine platform from SystemInfoStream. Analysis may be impaired."
+                "Could not determine a valid platform string from SystemInfoStream."
             )
 
     def _process_memory_info_list_stream(self, mem_info_list_data) -> None:
-        """processes the memoryinfolist stream to cache memory region protections."""
+        """helper: processes memoryinfolist stream to cache memory region protections."""
+        # KSY: enums: stream_types: 16: memory_info_list
+        # KSY does NOT define the structure for `memory_info_list` type itself.
         if not mem_info_list_data:
             self.log.log_warn(
-                "MemoryInfoListStream not found. Segment permissions may be inaccurate."
-            )
-            return
-
-        self.log.log_debug("Processing MemoryInfoListStream...")
-        # IMPORTANT: Verify `mem_info_list_data.infos` with your Kaitai parser.
-        if hasattr(mem_info_list_data, "infos"):
-            for mem_info in mem_info_list_data.infos:
-                # IMPORTANT: Verify `mem_info.base_address` and `mem_info.protect`.
-                self._memory_protections[mem_info.base_address] = mem_info.protect
-            self.log.log_info(
-                f"Processed and cached {len(self._memory_protections)} memory info entries."
-            )
-        else:
-            self.log.log_warn(
-                "MemoryInfoListStream data does not have 'infos' attribute. Kaitai structure might differ."
-            )
-
-    def _process_memory_segments(self) -> None:
-        """processes memory64liststream or memoryliststream to map memory segments."""
-        mem64_list_data = self._parsed_streams.get(
-            WindowsMinidump.StreamTypeEnum.memory64_list_stream
-        )
-        mem_list_data = self._parsed_streams.get(
-            WindowsMinidump.StreamTypeEnum.memory_list_stream
-        )
-
-        if mem64_list_data:
-            self.log.log_debug("Processing Memory64ListStream...")
-            # IMPORTANT: Verify `mem64_list_data.base_rva` and `mem64_list_data.mem_ranges`.
-            base_rva_for_data = mem64_list_data.base_rva
-            current_file_offset_for_data = base_rva_for_data
-            self.log.log_info(
-                f"Memory64ListStream BaseRVA for data: 0x{base_rva_for_data:x}"
-            )
-            if hasattr(mem64_list_data, "mem_ranges"):
-                for mem_desc in mem64_list_data.mem_ranges:
-                    # IMPORTANT: Verify `mem_desc.start_of_memory_range` and `mem_desc.data_size`.
-                    va = mem_desc.start_of_memory_range
-                    size = mem_desc.data_size
-                    if size == 0:
-                        self.log.log_debug(
-                            f"  Skipping zero-size memory descriptor at VA 0x{va:x}."
-                        )
-                        continue
-
-                    self._min_virtual_address = min(self._min_virtual_address, va)
-                    self._max_virtual_address = max(
-                        self._max_virtual_address, va + size
-                    )
-
-                    protection_enum = self._memory_protections.get(va)
-                    r, w, x = self._translate_memory_protection(protection_enum)
-
-                    seg_flags = SegmentFlag(0)
-                    if r:
-                        seg_flags |= SegmentFlag.SegmentReadable
-                    if w:
-                        seg_flags |= SegmentFlag.SegmentWritable
-                    if x:
-                        seg_flags |= SegmentFlag.SegmentExecutable
-
-                    self.log.log_info(
-                        f"  Adding segment: VA=0x{va:0{self._address_size*2}x}, Size=0x{size:x}, FileOffset=0x{current_file_offset_for_data:x}, Flags={seg_flags!r}"
-                    )
-                    self.add_auto_segment(
-                        va, size, current_file_offset_for_data, size, seg_flags
-                    )
-                    self.set_comment_at(
-                        va,
-                        f"Minidump Memory Segment. Original Protection: {str(protection_enum) if protection_enum else 'Unknown'}",
-                    )
-                    current_file_offset_for_data += size
-            else:
-                self.log.log_warn(
-                    "Memory64ListStream data does not have 'mem_ranges' attribute. Kaitai structure might differ."
-                )
-
-        elif mem_list_data:
-            self.log.log_debug("Processing MemoryListStream (32-bit)...")
-            # IMPORTANT: Verify `mem_list_data.mem_ranges`.
-            if hasattr(mem_list_data, "mem_ranges"):
-                for mem_desc in mem_list_data.mem_ranges:
-                    # IMPORTANT: Verify Kaitai names: `mem_desc.start_of_memory_range`,
-                    # `mem_desc.memory.rva`, `mem_desc.memory.data_size`.
-                    va = mem_desc.start_of_memory_range
-                    file_offset_in_dump = mem_desc.memory.rva
-                    size = mem_desc.memory.data_size
-                    if size == 0:
-                        self.log.log_debug(
-                            f"  Skipping zero-size memory descriptor at VA 0x{va:x}."
-                        )
-                        continue
-
-                    self._min_virtual_address = min(self._min_virtual_address, va)
-                    self._max_virtual_address = max(
-                        self._max_virtual_address, va + size
-                    )
-
-                    protection_enum = self._memory_protections.get(va)
-                    r, w, x = self._translate_memory_protection(protection_enum)
-
-                    seg_flags = SegmentFlag(0)
-                    if r:
-                        seg_flags |= SegmentFlag.SegmentReadable
-                    if w:
-                        seg_flags |= SegmentFlag.SegmentWritable
-                    if x:
-                        seg_flags |= SegmentFlag.SegmentExecutable
-
-                    self.log.log_info(
-                        f"  Adding segment: VA=0x{va:0{self._address_size*2}x}, Size=0x{size:x}, FileOffset=0x{file_offset_in_dump:x}, Flags={seg_flags!r}"
-                    )
-                    self.add_auto_segment(
-                        va, size, file_offset_in_dump, size, seg_flags
-                    )
-                    self.set_comment_at(
-                        va,
-                        f"Minidump Memory Segment. Original Protection: {str(protection_enum) if protection_enum else 'Unknown'}",
-                    )
-            else:
-                self.log.log_warn(
-                    "MemoryListStream data does not have 'mem_ranges' attribute. Kaitai structure might differ."
-                )
-        else:
-            self.log.log_warn(
-                "No memory list stream found (Memory64ListStream or MemoryListStream). Memory map will be incomplete."
-            )
-
-    def _process_module_list_stream(self, module_list_data) -> None:
-        """processes the modulelist stream to define sections and symbols for loaded modules."""
-        if not module_list_data:
-            self.log.log_warn("ModuleListStream not found. No modules will be defined.")
-            return
-
-        # IMPORTANT: Verify `module_list_data.modules`.
-        if not hasattr(module_list_data, "modules"):
-            self.log.log_warn(
-                "ModuleListStream data does not have 'modules' attribute. Kaitai structure might differ."
+                "MemoryInfoListStream not found or not parsed by KSY. Segment permissions may be inaccurate."
             )
             return
 
         self.log.log_info(
-            f"Processing {len(module_list_data.modules)} modules from ModuleListStream."
+            "MemoryInfoListStream processing: KSY snippet does not define its structure. Cannot extract protections."
         )
-        for mod_info in module_list_data.modules:
-            # IMPORTANT: Verify Kaitai names: `mod_info.module_name.name`,
-            # `mod_info.base_of_image`, `mod_info.size_of_image`.
-            try:
-                # `module_name` is typically a MINIDUMP_STRING structure in Kaitai.
-                # It should have an attribute like `name` or `str_` for the actual string.
-                name = mod_info.module_name.name
-            except AttributeError:
+        # If KSY were extended for MINIDUMP_MEMORY_INFO_LIST and MINIDUMP_MEMORY_INFO:
+        # if hasattr(mem_info_list_data, "infos"): # Assuming 'infos' is the list of MINIDUMP_MEMORY_INFO
+        #     for mem_info in mem_info_list_data.infos:
+        #         # Assuming mem_info has 'base_address' and 'protect' (protection flags)
+        #         self._memory_protections[mem_info.base_address] = mem_info.protect
+        #     self.log.log_info(f"Processed protection info for {len(self._memory_protections)} memory regions.")
+        # else:
+        #     self.log.log_warn("MemoryInfoListStream data structure not as expected from KSY for 'infos'.")
+
+    def _process_memory_segments(self) -> None:
+        """helper: processes memory_list (or memory_64_list if KSY defined it) to map memory segments."""
+        # KSY defines `memory_list` (type 5) and `memory_64_list` (type 9) in enums,
+        # but only `memory_list` structure is defined in `types`.
+
+        mem_list_data = self._parsed_streams.get(
+            WindowsMinidump.StreamTypes.memory_list
+        )
+        mem64_list_data = (
+            self._parsed_streams.get(  # This will be None if KSY doesn't parse type 9
+                WindowsMinidump.StreamTypes.memory_64_list
+            )
+        )
+
+        if mem64_list_data:
+            self.log.log_warn(
+                "Memory64ListStream found in directory, but its structure is not defined in the provided KSY snippet. Processing will be skipped."
+            )
+            # If KSY for Memory64ListStream and MINIDUMP_MEMORY_DESCRIPTOR64 was available:
+            # self.log.log_debug("Processing Memory64ListStream for memory segments...")
+            # base_rva_for_data = mem64_list_data.base_rva # KSY dependent name
+            # current_file_offset_for_data = base_rva_for_data
+            # if hasattr(mem64_list_data, "mem_ranges"): # KSY dependent name
+            #     for mem_desc64 in mem64_list_data.mem_ranges:
+            #         va = mem_desc64.start_of_memory_range # KSY dependent name
+            #         size = mem_desc64.data_size # KSY dependent name
+            #         if size == 0: continue
+            #         self._update_virtual_address_extents(va, size)
+            #         protection_enum = self._memory_protections.get(va)
+            #         r, w, x = self._translate_memory_protection(protection_enum)
+            #         seg_flags = self._build_segment_flags(r, w, x)
+            #         self.add_auto_segment(va, size, current_file_offset_for_data, size, seg_flags)
+            #         self._add_segment_comment(va, protection_enum, r, w, x, "Memory64ListStream")
+            #         current_file_offset_for_data += size
+            # else: self.log.log_warn("Memory64ListStream structure in KSY seems incomplete (missing mem_ranges).")
+
+        elif mem_list_data:  # KSY defines structure for memory_list
+            self.log.log_debug(
+                "Processing MemoryListStream (MINIDUMP_MEMORY_LIST) for memory segments..."
+            )
+            # KSY: types: memory_list: seq: - mem_ranges (list of memory_descriptor)
+            # KSY: types: memory_descriptor: seq: - addr_memory_range (u8, VA)
+            #                                    - memory (location_descriptor)
+            # KSY: types: location_descriptor: seq: - len_data (u4, size)
+            #                                        - ofs_data (u4, RVA in file)
+            if hasattr(mem_list_data, "mem_ranges"):
+                for mem_desc in mem_list_data.mem_ranges:
+                    try:
+                        va = mem_desc.addr_memory_range
+                        file_offset_in_dump = mem_desc.memory.ofs_data
+                        size = mem_desc.memory.len_data
+                        if size == 0:
+                            self.log.log_debug(
+                                f"  Skipping zero-size mem desc at VA 0x{va:x} (MemoryList)."
+                            )
+                            continue
+                        self._update_virtual_address_extents(va, size)
+                        protection_enum = self._memory_protections.get(va)
+                        r, w, x = self._translate_memory_protection(protection_enum)
+                        seg_flags = self._build_segment_flags(r, w, x)
+                        self.log.log_info(
+                            f"  Adding segment (MemoryList): VA=0x{va:0{self._address_size*2}x}, Size=0x{size:x}, "
+                            f"FileOffset=0x{file_offset_in_dump:x}, Flags={seg_flags!r}"
+                        )
+                        self.add_auto_segment(
+                            va, size, file_offset_in_dump, size, seg_flags
+                        )
+                        self._add_segment_comment(
+                            va, protection_enum, r, w, x, "MemoryListStream"
+                        )
+                    except AttributeError as e:
+                        self.log.log_error(
+                            f"Error processing a memory_descriptor in MemoryListStream (KSY mismatch?): {e}"
+                        )
+                        continue  # Skip to next descriptor
+            else:
                 self.log.log_warn(
-                    f"Could not get module name for module at base 0x{mod_info.base_of_image:x}. Kaitai structure for MinidumpString might differ. Defaulting name."
+                    "MemoryListStream missing 'mem_ranges' attribute. Cannot map memory."
                 )
-                name = f"UnknownModule_0x{mod_info.base_of_image:x}"
-
-            base_va = mod_info.base_of_image
-            size = mod_info.size_of_image
-
-            self.log.log_info(
-                f"  Adding module: {name}, BaseVA=0x{base_va:0{self._address_size*2}x}, Size=0x{size:x}"
+        else:
+            self.log.log_warn(
+                "No MemoryListStream (or parsable Memory64ListStream) found. Memory map will be incomplete."
             )
-            self.add_auto_section(
-                name, base_va, size, SectionSemantics.ReadOnlyCodeSectionSemantics
-            )  # Default, can be refined
-            self.define_auto_symbol(Symbol(SymbolType.LibrarySymbol, base_va, name))
-            self.set_comment_at(
-                base_va,
-                f"Module: {name}\nTimestamp: {mod_info.time_date_stamp_as_datetime if hasattr(mod_info, 'time_date_stamp_as_datetime') else mod_info.time_date_stamp}\nChecksum: 0x{mod_info.checksum:x}",
+
+    def _update_virtual_address_extents(self, va: int, size: int):
+        """helper: updates the overall min/max virtual addresses based on a new segment."""
+        self._min_virtual_address = min(self._min_virtual_address, va)
+        self._max_virtual_address = max(self._max_virtual_address, va + size)
+
+    def _build_segment_flags(self, r: bool, w: bool, x: bool) -> SegmentFlag:
+        """helper: constructs SegmentFlag from boolean permissions."""
+        seg_flags = SegmentFlag(0)
+        if r:
+            seg_flags |= SegmentFlag.SegmentReadable
+        if w:
+            seg_flags |= SegmentFlag.SegmentWritable
+        if x:
+            seg_flags |= SegmentFlag.SegmentExecutable
+        return seg_flags
+
+    def _add_segment_comment(
+        self, va: int, protection_enum, r: bool, w: bool, x: bool, stream_name: str
+    ):
+        """helper: adds a descriptive comment to a newly added segment."""
+        # Try to get a more readable protection string if KSY provides enums for it
+        protection_str = (
+            str(protection_enum)
+            if protection_enum
+            else "Unknown (MemoryInfoList not available or KSY incomplete)"
+        )
+        if hasattr(protection_enum, "name"):  # If it's a Kaitai enum with a name
+            protection_str = protection_enum.name
+
+        self.set_comment_at(
+            va,
+            f"Minidump Memory Segment (from {stream_name})\n"
+            f"Original Protection: {protection_str}\n"
+            f"Mapped Permissions: R={'Y' if r else 'N'}, W={'Y' if w else 'N'}, X={'Y' if x else 'N'}",
+        )
+
+    def _process_module_list_stream(self, module_list_data) -> None:
+        """helper: processes modulelist stream to define sections and symbols."""
+        # KSY: enums: stream_types: 4: module_list
+        # KSY does NOT define the structure for `module_list` or `MINIDUMP_MODULE`.
+        if not module_list_data:
+            self.log.log_warn(
+                "ModuleListStream not found or not parsed by KSY. No modules will be defined."
             )
+            return
+        self.log.log_info(
+            "ModuleListStream processing: KSY snippet does not define its structure. Cannot list modules."
+        )
+        # Example if KSY was extended for MINIDUMP_MODULE_LIST and MINIDUMP_MODULE:
+        # if hasattr(module_list_data, "modules"): # Assuming 'modules' is list of MINIDUMP_MODULE
+        #     self.log.log_info(f"Processing {len(module_list_data.modules)} modules from ModuleListStream.")
+        #     for mod_info in module_list_data.modules:
+        #         try:
+        #             # Assuming mod_info has 'module_name' (type minidump_string)
+        #             # and minidump_string has 'str' field for the actual string.
+        #             name = mod_info.module_name.str
+        #             base_va = mod_info.base_of_image
+        #             size = mod_info.size_of_image
+        #             timestamp_val = mod_info.time_date_stamp # Or _as_datetime if KSY adds it
+        #             checksum_val = mod_info.checksum
+        #
+        #             self.log.log_info(f"  Adding module: {name}, BaseVA=0x{base_va:0{self._address_size*2}x}, Size=0x{size:x}")
+        #             self.add_auto_section(name, base_va, size, SectionSemantics.ReadOnlyCodeSectionSemantics)
+        #             self.define_auto_symbol(Symbol(SymbolType.LibrarySymbol, base_va, name))
+        #             self.set_comment_at(base_va, f"Module: {name}\nBase: 0x{base_va:x}\nSize: 0x{size:x}\nTimestampRaw: 0x{timestamp_val:x}\nChecksum: 0x{checksum_val:x}")
+        #         except AttributeError as e:
+        #             self.log.log_error(f"Error processing a module entry (KSY mismatch for MINIDUMP_MODULE?): {e}")
+        #             continue
 
     def _process_thread_list_stream(self, thread_list_data) -> None:
-        """processes the threadlist stream for thread information, stacks, and contexts."""
-        if not thread_list_data:
+        """helper: processes threadlist stream for thread info, stacks, and contexts."""
+        if not thread_list_data:  # thread_list is defined in KSY
             self.log.log_warn("ThreadListStream not found.")
             return
-
-        # IMPORTANT: Verify `thread_list_data.threads`.
+        # KSY: types: thread_list: seq: - threads (list of `thread` type)
         if not hasattr(thread_list_data, "threads"):
             self.log.log_warn(
-                "ThreadListStream data does not have 'threads' attribute. Kaitai structure might differ."
+                "ThreadListStream missing 'threads' attribute. Cannot process threads."
             )
             return
 
         self.log.log_info(
             f"Processing {len(thread_list_data.threads)} threads from ThreadListStream."
         )
-        for i, thread in enumerate(thread_list_data.threads):
-            # IMPORTANT: Verify Kaitai names like `thread.thread_id`, `thread.stack.start_of_memory_range`,
-            # `thread.thread_context_actual.program_counter` (or similar for register access).
-            tid = thread.thread_id
-            stack_va = thread.stack.start_of_memory_range
-            stack_size = (
-                thread.stack.memory.data_size
-            )  # Assuming this field exists for stack data size
-            teb = thread.teb
+        for i, thread_entry in enumerate(thread_list_data.threads):
+            # KSY: types: thread: seq: - thread_id (u4)
+            #                          - stack (memory_descriptor)
+            #                          - teb (u8)
+            #                          - thread_context (location_descriptor)
+            try:
+                tid = thread_entry.thread_id
+                stack_va = thread_entry.stack.addr_memory_range
+                stack_size = thread_entry.stack.memory.len_data
+                teb = thread_entry.teb
 
-            self.log.log_info(
-                f"  Thread ID: {tid}, Stack Start: 0x{stack_va:x}, Stack Size: 0x{stack_size:x}, TEB: 0x{teb:x}"
-            )
-            self.set_comment_at(
-                stack_va, f"Thread {tid} Stack (Size: 0x{stack_size:x})"
-            )
-
-            # process thread context for registers
-            # the actual context structure (e.g., `thread.thread_context_actual`) and register names
-            # will heavily depend on the Kaitai .ksy definition for MINIDUMP_CONTEXT.
-            # this is a placeholder and needs to be adapted.
-            if (
-                hasattr(thread, "thread_context_actual")
-                and thread.thread_context_actual
-            ):
-                context = thread.thread_context_actual
-                # example for x86_64, names will vary based on .ksy
-                ip_reg_name = None
-                if self._arch and self._arch.name == "x86_64":
-                    ip_reg_name = "rip"
-                elif self._arch and self._arch.name == "x86":
-                    ip_reg_name = "eip"
-                elif self._arch and self._arch.name == "aarch64":
-                    ip_reg_name = "pc"  # Or x30 if LR is PC
-                # Add more architectures
-
-                if ip_reg_name and hasattr(context, ip_reg_name):
-                    ip = getattr(context, ip_reg_name)
-                    self.log.log_info(
-                        f"    Thread {tid} Instruction Pointer ({ip_reg_name.upper()}): 0x{ip:x}"
-                    )
-                    self.define_auto_symbol(
-                        Symbol(
-                            SymbolType.CodeSymbol,
-                            ip,
-                            f"Thread_{tid}_{ip_reg_name.upper()}",
-                        )
-                    )
-                    self.set_comment_at(
-                        ip, f"Thread {tid} Instruction Pointer at time of dump."
-                    )
-                else:
-                    self.log.log_warn(
-                        f"    Thread {tid}: Could not determine instruction pointer register name or value from context."
-                    )
-                # Log other key registers if available and relevant
-            else:
-                self.log.log_warn(
-                    f"    Thread {tid}: No detailed context information found or 'thread_context_actual' missing."
+                self.log.log_info(
+                    f"  Thread ID: {tid}, Stack Start: 0x{stack_va:x}, Stack Size: 0x{stack_size:x}, TEB: 0x{teb:x}"
+                )
+                self.set_comment_at(
+                    stack_va,
+                    f"Thread {tid} Stack (Size: 0x{stack_size:x}, TEB: 0x{teb:x})",
+                )
+                self.define_auto_symbol(
+                    Symbol(SymbolType.DataSymbol, stack_va, f"Thread_{tid}_StackBase")
                 )
 
+                # Thread context (registers) is in a location_descriptor.
+                # Its actual data (e.g., CONTEXT_AMD64) needs to be read from the file at `thread_entry.thread_context.ofs_data`.
+                # The KSY does not define these CPU-specific context structures.
+                context_loc = thread_entry.thread_context
+                self.log.log_debug(
+                    f"    Thread {tid} context location: RVA=0x{context_loc.ofs_data:x}, Size=0x{context_loc.len_data:x}"
+                )
+                # To parse registers, you would:
+                # 1. Read `context_loc.len_data` bytes from `self.raw_data` at `context_loc.ofs_data`.
+                # 2. Parse these bytes using another KSY for the specific CONTEXT structure (e.g., context_amd64.ksy)
+                #    or manually parse known register offsets.
+                # self._parse_and_log_thread_context_registers(tid, context_loc.ofs_data, context_loc.len_data)
+                self.log.log_warn(
+                    f"    Thread {tid}: Detailed context parsing (registers) requires KSY extension for CONTEXT structure and additional parsing logic."
+                )
+            except AttributeError as e:
+                self.log.log_error(
+                    f"Error processing thread entry {i} (KSY mismatch?): {e}"
+                )
+                continue
+
     def _process_exception_stream(self, exception_data) -> None:
-        """processes the exception stream if present."""
-        if not exception_data:
+        """helper: processes the exception stream, if present."""
+        if not exception_data:  # exception_stream is defined in KSY
             self.log.log_debug(
-                "No ExceptionStream found."
-            )  # Not an error, dump might not be from a crash
+                "No ExceptionStream found (dump may not be from a crash)."
+            )
             return
 
-        # IMPORTANT: Verify Kaitai names like `exception_data.thread_id`,
-        # `exception_data.exception_record_actual.exception_address`, `.exception_code`, etc.
         self.log.log_info("Processing ExceptionStream...")
+        # KSY: types: exception_stream: seq: - thread_id (u4)
+        #                                   - exception_rec (exception_record)
+        #                                   - thread_context (location_descriptor)
+        # KSY: types: exception_record: seq: - code (u4), flags (u4), addr (u8), num_params (u4), params (array of u8)
         try:
             thread_id = exception_data.thread_id
-            record = (
-                exception_data.exception_record_actual
-            )  # Assuming Kaitai parses the record here
-            exc_addr = record.exception_address
-            exc_code = record.exception_code  # This will be an enum
-            exc_flags = record.flags  # This will be an enum
+            record = exception_data.exception_rec
+            exc_addr = record.addr
+            exc_code_val = record.code
+            exc_flags_val = record.flags
 
-            self.log.log_warn(f"  Exception occurred in Thread ID: {thread_id}")
+            exc_code_str = self._map_exception_code_to_string(exc_code_val)
+
+            self.log.log_warn(f"  EXCEPTION Occurred in Thread ID: {thread_id}")
+            self.log.log_warn(f"  Exception Code: 0x{exc_code_val:X} ({exc_code_str})")
+            self.log.log_warn(f"  Exception Flags: 0x{exc_flags_val:X}")
             self.log.log_warn(
-                f"  Exception Code: {exc_code!r} ({self._get_exception_code_string(exc_code)})"
-            )
-            self.log.log_warn(f"  Exception Flags: {exc_flags!r}")
-            self.log.log_warn(
-                f"  Exception Address: 0x{exc_addr:0{self._address_size*2}x}"
+                f"  Exception Address (Faulting IP): 0x{exc_addr:0{self._address_size*2}x}"
             )
 
             comment = (
-                f"Minidump Exception Site\n"
+                f"== MINIDUMP CRASH SITE ==\n"
                 f"Thread ID: {thread_id}\n"
-                f"Exception Code: {exc_code!r} ({self._get_exception_code_string(exc_code)})\n"
+                f"Exception Code: 0x{exc_code_val:X} ({exc_code_str})\n"
                 f"Faulting Address: 0x{exc_addr:0{self._address_size*2}x}"
             )
             if (
-                hasattr(record, "exception_information")
-                and record.exception_information
+                hasattr(record, "params")
+                and hasattr(record, "num_params")
+                and record.num_params > 0
             ):
-                comment += f"\n  Parameters: {record.exception_information}"
+                # KSY defines params as u8[15], so we take the first num_params.
+                # These are 64-bit parameters, so each takes 8 bytes if that's the intent.
+                # The KSY defines `params` as `type: u8, repeat-expr: 15`. This is unusual for exception parameters
+                # which are usually ULONG_PTR. This KSY definition might be simplified or incorrect for `params`.
+                # Assuming for now they are just raw u8 values as per KSY.
+                params_to_show = record.params[
+                    : record.num_params
+                ]  # This will be a list of u8 values.
+                params_str = ", ".join(
+                    [f"0x{p:02x}" for p in params_to_show]
+                )  # Log as bytes
+                comment += f"\nException Information (raw bytes): [{params_str}]"
+                self.log.log_warn(
+                    f"  Exception Information (raw bytes, first {record.num_params}): [{params_str}]"
+                )
+                # A more accurate KSY would define params as array of u8 or u_long_ptr.
 
             self.set_comment_at(exc_addr, comment)
             if self._crash_tag_type:
-                self.add_tag(
-                    exc_addr,
-                    self._crash_tag_type,
-                    "Minidump crash site reported by ExceptionStream.",
-                )
+                self.add_tag(exc_addr, self._crash_tag_type, f"Crash: {exc_code_str}")
 
-            # attempt to set entry point to the crash site for quick navigation
             self.log.log_info(
-                f"Setting entry point to exception address 0x{exc_addr:x}"
+                f"Setting active entry point to exception address 0x{exc_addr:x}"
             )
+            if self.entry_points:  # Clear any previous default entry point
+                current_eps = list(self.entry_points)
+                for ep_addr in current_eps:
+                    self.remove_entry_point(ep_addr)
             self.add_entry_point(exc_addr)
 
         except AttributeError as e:
             self.log.log_error(
-                f"Error accessing attributes in ExceptionStream data (Kaitai structure might differ): {e}"
+                f"Error accessing attributes in ExceptionStream (Kaitai structure might differ): {e}"
             )
         except Exception as e:
             self.log.log_error(f"Unexpected error processing ExceptionStream: {e}")
             self.log.log_error(traceback.format_exc())
 
-    def _get_exception_code_string(self, exc_code_enum) -> str:
-        """Helper to get a string representation of an exception code enum."""
-        # This is highly dependent on your Kaitai enum definition for exception codes.
-        # Example: if exc_code_enum is WindowsMinidump.ExceptionCodeEnum.access_violation
-        if hasattr(
-            exc_code_enum, "name"
-        ):  # Kaitai enums usually have a 'name' attribute
-            return exc_code_enum.name
-        return str(exc_code_enum)  # Fallback to raw enum value
+    def _map_exception_code_to_string(self, code: int) -> str:
+        """Maps common Windows exception codes to human-readable strings."""
+        # This is a basic mapping. A more comprehensive one could be used.
+        # https://learn.microsoft.com/en-us/windows/win32/debug/structured-exception-handling
+        # These are common NTSTATUS values often seen as exception codes.
+        common_codes = {
+            0xC0000005: "Access Violation",
+            0xC0000006: "In-page I/O Error",
+            0xC0000017: "No Memory",
+            0xC000001D: "Illegal Instruction",
+            0xC0000025: "Noncontinuable Exception",
+            0xC0000026: "Invalid Disposition",
+            0xC000008C: "Array Bounds Exceeded",
+            0xC0000090: "Float Denormal Operand",
+            0xC0000091: "Float Divide by Zero",
+            0xC0000092: "Float Inexact Result",
+            0xC0000093: "Float Invalid Operation",
+            0xC0000094: "Integer Divide by Zero",
+            0xC0000095: "Integer Overflow",
+            0xC0000096: "Privileged Instruction",
+            0xC00000FD: "Stack Overflow",
+            0xC0000135: "DLL Not Found",
+            0xC0000138: "Ordinal Not Found",
+            0xC0000139: "Entry Point Not Found",
+            0xC0000142: "DLL Initialization Failed",
+            0x80000001: "Guard Page Violation",
+            0x80000002: "Datatype Misalignment",
+            0x80000003: "Breakpoint",
+            0x80000004: "Single Step",
+        }
+        return common_codes.get(code, f"Unknown (0x{code:X})")
 
     def _process_unloaded_module_list_stream(self, unloaded_module_data) -> None:
+        """helper: logs information about unloaded modules."""
+        # KSY: enums: stream_types: 14: unloaded_module_list
+        # KSY does NOT define the structure for `unloaded_module_list`.
         if not unloaded_module_data:
-            self.log.log_debug("No UnloadedModuleListStream found.")
-            return
-        # IMPORTANT: Verify `unloaded_module_data.modules`.
-        if not hasattr(unloaded_module_data, "modules"):
-            self.log.log_warn(
-                "UnloadedModuleListStream data does not have 'modules' attribute. Kaitai structure might differ."
+            self.log.log_debug(
+                "No UnloadedModuleListStream found or not parsed by KSY."
             )
             return
-
         self.log.log_info(
-            f"Processing {len(unloaded_module_data.modules)} unloaded modules."
+            "UnloadedModuleListStream processing: KSY snippet does not define its structure."
         )
-        for mod_info in unloaded_module_data.modules:
-            # IMPORTANT: Verify Kaitai names.
-            try:
-                name = mod_info.module_name.name
-                base = mod_info.base_of_image
-                size = mod_info.size_of_image
-                self.log.log_info(
-                    f"  Unloaded Module: {name}, Base: 0x{base:x}, Size: 0x{size:x}"
-                )
-                # could add comments or non-mapped sections if desired, but they are unloaded.
-            except AttributeError:
-                self.log.log_warn(
-                    f"Could not fully parse unloaded module entry. Kaitai structure might differ."
-                )
 
     def _process_handle_data_stream(self, handle_data) -> None:
+        """helper: logs basic information about open handles."""
+        # KSY: enums: stream_types: 12: handle_data
+        # KSY does NOT define the structure for `handle_data`.
         if not handle_data:
-            self.log.log_debug("No HandleDataStream found.")
+            self.log.log_debug("No HandleDataStream found or not parsed by KSY.")
             return
-        # IMPORTANT: Verify `handle_data.handles`.
-        if not hasattr(handle_data, "handles"):
-            self.log.log_warn(
-                "HandleDataStream data does not have 'handles' attribute. Kaitai structure might differ."
-            )
-            return
-
-        self.log.log_info(f"Processing {len(handle_data.handles)} handles.")
-        for i, handle_desc in enumerate(handle_data.handles):
-            # IMPORTANT: Verify Kaitai names for handle attributes.
-            try:
-                obj_name_rva = (
-                    handle_desc.object_name_rva
-                )  # This is an RVA into the minidump file
-                type_name_rva = handle_desc.type_name_rva  # This is an RVA
-                # To get actual names, you'd need to read these RVAs from self.raw_data
-                # and parse the MINIDUMP_STRING structures there. Kaitai might not do this automatically
-                # if the .ksy defines them just as RVAs.
-                # For now, just log the RVAs.
-                self.log.log_debug(
-                    f"  Handle {i}: HandleValue=0x{handle_desc.handle:x}, TypeNameRVA=0x{type_name_rva:x}, ObjectNameRVA=0x{obj_name_rva:x}, Attributes=0x{handle_desc.attributes:x}"
-                )
-            except AttributeError:
-                self.log.log_warn(
-                    f"Could not fully parse handle entry {i}. Kaitai structure might differ."
-                )
+        self.log.log_info(
+            "HandleDataStream processing: KSY snippet does not define its structure."
+        )
 
     def _process_misc_info_stream(self, misc_info_data) -> None:
-        if not misc_info_data:
+        """helper: logs miscellaneous process information."""
+        if not misc_info_data:  # misc_info is defined in KSY
             self.log.log_debug("No MiscInfoStream found.")
             return
 
         self.log.log_info("Processing MiscInfoStream...")
-        # IMPORTANT: Verify Kaitai names like `misc_info_data.process_id`, `misc_info_data.process_create_time_as_datetime`.
+        # KSY: types: misc_info: seq: - process_id (u4), process_create_time (u4), etc.
         try:
-            pid = (
-                misc_info_data.process_id
-                if hasattr(misc_info_data, "process_id")
-                else "N/A"
+            pid_val = misc_info_data.process_id
+            create_time_raw = misc_info_data.process_create_time
+            try:
+                create_time_dt = datetime.datetime.fromtimestamp(
+                    create_time_raw, tz=datetime.timezone.utc
+                )
+                create_time_str = create_time_dt.isoformat()
+            except Exception as ts_ex:
+                create_time_str = f"Invalid raw value 0x{create_time_raw:x} ({ts_ex})"
+                self.log.log_warn(
+                    f"MiscInfo: Could not convert process_create_time: {ts_ex}"
+                )
+
+            self.log.log_info(f"  Process ID (PID): {pid_val}")
+            self.log.log_info(
+                f"  Process Create Time: {create_time_str} (Raw: 0x{create_time_raw:x})"
             )
-            create_time = (
-                misc_info_data.process_create_time_as_datetime
-                if hasattr(misc_info_data, "process_create_time_as_datetime")
-                else misc_info_data.process_create_time
-            )
-            self.log.log_info(f"  Process ID: {pid}")
-            self.log.log_info(f"  Process Create Time: {create_time}")
-            # Add more fields as needed (user time, kernel time, processor info)
-        except AttributeError:
+
+            # Log other fields if they exist, as defined by KSY's misc_info
+            if hasattr(misc_info_data, "flags1"):
+                self.log.log_debug(f"  MiscInfo Flags1: 0x{misc_info_data.flags1:x}")
+            if hasattr(misc_info_data, "process_user_time"):
+                self.log.log_info(
+                    f"  Process User Time: {misc_info_data.process_user_time} (units depend on OS, often 100ns intervals)"
+                )
+            if hasattr(misc_info_data, "process_kernel_time"):
+                self.log.log_info(
+                    f"  Process Kernel Time: {misc_info_data.process_kernel_time}"
+                )
+            if hasattr(misc_info_data, "cpu_max_mhz"):
+                self.log.log_info(f"  CPU Max MHz: {misc_info_data.cpu_max_mhz}")
+            if hasattr(misc_info_data, "cpu_cur_mhz"):
+                self.log.log_info(f"  CPU Current MHz: {misc_info_data.cpu_cur_mhz}")
+
+        except AttributeError as e:
             self.log.log_warn(
-                "Could not fully parse MiscInfoStream. Kaitai structure might differ."
+                f"Could not fully parse MiscInfoStream due to missing attributes: {e}. Kaitai structure might differ."
             )
 
     def _finalize_view_setup(self) -> None:
-        """final setup steps after all core streams are processed."""
-        # if no specific entry point was set (e.g., from exception), default to start or 0.
-        if not self.entry_points:
+        """helper: performs final setup steps, like setting a default entry point if none was set by exception stream."""
+        if (
+            not self.entry_points
+        ):  # if no entry point was set (e.g., by exception stream)
             entry_candidate = (
                 self._min_virtual_address
                 if self._min_virtual_address != 0xFFFFFFFFFFFFFFFF
                 else 0
             )
             self.log.log_info(
-                f"No explicit entry point set, defaulting to 0x{entry_candidate:x} (min VA or 0)."
+                f"No explicit entry point set by other streams, defaulting to 0x{entry_candidate:x} (min VA or 0)."
             )
             self.add_entry_point(entry_candidate)
 
-        # Consider triggering an initial analysis update if desired,
-        # though often it's better to let the user do this.
-        # self.update_analysis_and_wait()
+        self.log.log_info("View setup finalized. Ready for analysis.")
 
     def _get_or_create_tag_type(self, name: str, icon: str) -> TagType | None:
-        """gets an existing tag type or creates it if it doesn't exist."""
+        """helper: gets an existing tag type or creates it if it doesn't exist, caching the result."""
         try:
             tag_type = self.get_tag_type(name)
             if tag_type:
                 self.log.log_debug(f"Found existing TagType '{name}'.")
                 return tag_type
-        except KeyError:  # BN may raise KeyError if not found
-            pass
-        except Exception as e:  # Catch other potential issues
+        except KeyError:
+            self.log.log_debug(f"TagType '{name}' not found, will attempt to create.")
+        except Exception as e:
             self.log.log_warn(f"Error checking for existing TagType '{name}': {e}")
 
         try:
             self.log.log_info(f"Creating new TagType '{name}' with icon '{icon}'.")
             return self.create_tag_type(name, icon)
-        except (
-            Exception
-        ) as e:  # Catch errors during creation (e.g., already exists by different case)
+        except Exception as e:
             self.log.log_error(
-                f"Failed to create TagType '{name}': {e}. Trying to get it again."
+                f"Failed to create TagType '{name}': {e}. Attempting to retrieve it again."
             )
-            # It might have been created by another part or with different casing, try getting it again.
             try:
                 return self.get_tag_type(name)
             except Exception:
                 self.log.log_error(
-                    f"Still could not get TagType '{name}' after creation attempt."
+                    f"Still could not get or create TagType '{name}' after multiple attempts."
                 )
                 return None
+
+    def _map_system_info_to_platform(
+        self, sys_info_data
+    ) -> tuple[str | None, str | None]:
+        """helper: maps minidump system info to bn platform/arch strings."""
+        # KSY: types: system_info: seq: - cpu_arch (enum: cpu_archs)
+        # KSY: enums: cpu_archs: 0: intel, 5: arm, 6: ia64, 9: amd64, 0xffff: unknown
+        arch_str: str | None = None
+        os_str: str | None = "windows"  # Minidumps are primarily Windows.
+
+        try:
+            cpu_arch_enum = sys_info_data.cpu_arch
+
+            if cpu_arch_enum == WindowsMinidump.SystemInfo.CpuArchs.intel:
+                arch_str = "x86"
+            elif cpu_arch_enum == WindowsMinidump.SystemInfo.CpuArchs.amd64:
+                arch_str = "x86_64"
+            elif cpu_arch_enum == WindowsMinidump.SystemInfo.CpuArchs.arm:
+                arch_str = "armv7"  # Common BN target for 32-bit ARM
+            # The KSY provided does not have an 'arm64' member in SystemInfo.CpuArchs.
+            # If your full KSY has it, you'd add:
+            # elif cpu_arch_enum == WindowsMinidump.SystemInfo.CpuArchs.arm64:
+            #      arch_str = "aarch64"
+            elif cpu_arch_enum == WindowsMinidump.SystemInfo.CpuArchs.ia64:
+                arch_str = "ia64"
+                self.log.log_warn(
+                    "IA64 architecture detected; ensure Binary Ninja has 'windows-ia64' platform support."
+                )
+            elif cpu_arch_enum == WindowsMinidump.SystemInfo.CpuArchs.unknown:
+                self.log.log_warn(
+                    f"CPU architecture reported as 'unknown' by minidump."
+                )
+                return None, os_str
+            else:  # Handles any other enum values not explicitly mapped
+                self.log.log_warn(
+                    f"Unrecognized or unmapped CPU architecture enum value: {cpu_arch_enum!r}"
+                )
+                return None, os_str
+
+            return arch_str, os_str
+
+        except AttributeError as e:
+            self.log.log_error(
+                f"Error accessing cpu_arch in SystemInfo data (Kaitai structure might differ): {e}"
+            )
+            return None, None
+        except Exception as e:
+            self.log.log_error(f"Unexpected error in _map_system_info_to_platform: {e}")
+            self.log.log_error(traceback.format_exc())
+            return None, None
+
+    def _translate_memory_protection(
+        self, minidump_protect_flags_val
+    ) -> tuple[bool, bool, bool]:
+        """
+        helper: translates minidump memory protection flags to r,w,x booleans.
+        the minidump_protect_flags_val is assumed to be an integer corresponding to
+        windows page_xxx constants, as memoryinfoliststream structure is not in the ksy snippet.
+        """
+        if minidump_protect_flags_val is None:
+            # this happens if memoryinfoliststream is missing or a region has no entry.
+            self.log.log_debug(
+                "No memory protection flags provided for segment, defaulting to R-X (readable, executable)."
+            )
+            return True, False, True  # A common default for unknown executable memory
+
+        # windows page_xxx constants for memory protection.
+        PAGE_NOACCESS = 0x01
+        PAGE_READONLY = 0x02
+        PAGE_READWRITE = 0x04
+        PAGE_WRITECOPY = 0x08  # often treated as read-write for static analysis
+        PAGE_EXECUTE = 0x10
+        PAGE_EXECUTE_READ = 0x20
+        PAGE_EXECUTE_READWRITE = 0x40
+        PAGE_EXECUTE_WRITECOPY = 0x80  # often treated as execute-read-write
+
+        # PAGE_GUARD (0x100), PAGE_NOCACHE (0x200), PAGE_WRITECOMBINE (0x400) are modifiers.
+        # we primarily care about the base r,w,x permissions.
+        # a guarded page, for example, still has its underlying r/w/x permissions.
+
+        r, w, x = False, False, False
+
+        current_flags = minidump_protect_flags_val
+        # if kaitai were to parse this as an enum with a .value, this would be useful:
+        # if not isinstance(current_flags, int) and hasattr(current_flags, 'value'):
+        #     current_flags = current_flags.value
+
+        if isinstance(current_flags, int):
+            # check most privileged combinations first.
+            if current_flags & PAGE_EXECUTE_READWRITE:
+                r, w, x = True, True, True
+            elif current_flags & PAGE_EXECUTE_WRITECOPY:
+                r, w, x = True, True, True
+            elif current_flags & PAGE_EXECUTE_READ:
+                r, x = True, True
+            elif current_flags & PAGE_EXECUTE:
+                x = True  # only execute
+            elif current_flags & PAGE_READWRITE:
+                r, w = True, True
+            elif current_flags & PAGE_WRITECOPY:
+                r, w = True, True
+            elif current_flags & PAGE_READONLY:
+                r = True
+            # if PAGE_NOACCESS (0x01) or other non-mapped value, r,w,x remain False.
+        else:
+            self.log.log_warn(
+                f"Unknown memory protection flag type/value: {minidump_protect_flags_val!r}. Defaulting to R-X."
+            )
+            return True, False, True  # Fallback for unhandled types
+
+        return r, w, x
 
     # --- required binaryview method implementations ---
 
@@ -701,12 +918,14 @@ class MinidumpView(BinaryView):
         return self._endianness
 
     def perform_get_entry_point(self) -> int:
-        if self.entry_points:  # self.entry_points is a list
+        if (
+            self.entry_points
+        ):  # self.entry_points is a list populated by add_entry_point()
             return self.entry_points[0]
         self.log.log_warn(
             "perform_get_entry_point: No entry point defined. Defaulting to 0."
         )
-        return 0
+        return 0  # Should be set by _finalize_view_setup if nothing else sets it.
 
     def perform_get_length(self) -> int:
         if (
@@ -716,11 +935,9 @@ class MinidumpView(BinaryView):
             self.log.log_warn(
                 "perform_get_length: No segments defined or min/max VA not updated. Returning 0."
             )
-            return 0  # No segments, or they were all zero-sized
+            return 0
         length = self._max_virtual_address - self._min_virtual_address
-        self.log.log_debug(
-            f"perform_get_length: Calculated VA space length: 0x{length:x}"
-        )
+        # self.log.log_debug(f"perform_get_length: Calculated VA space length: 0x{length:x}")
         return length
 
     def perform_get_start(self) -> int:
@@ -729,54 +946,46 @@ class MinidumpView(BinaryView):
                 "perform_get_start: Min virtual address not set (no segments?). Returning 0."
             )
             return 0
-        self.log.log_debug(
-            f"perform_get_start: Returning start address: 0x{self._min_virtual_address:x}"
-        )
+        # self.log.log_debug(f"perform_get_start: Returning start address: 0x{self._min_virtual_address:x}")
         return self._min_virtual_address
 
     def perform_is_executable(self) -> bool:
-        return True
+        return True  # Minidumps are snapshots of executable processes
 
     def perform_is_relocatable(self) -> bool:
-        return False
+        return False  # Minidumps are fixed snapshots
 
     def perform_read(self, addr: int, length: int) -> bytes | None:
-        # self.log.log_debug(f"perform_read: VA=0x{addr:x}, Length=0x{length:x}")
-        for seg in self.segments:  # self.segments is provided by BinaryView base
-            if seg.start <= addr < seg.end:
+        for (
+            seg
+        ) in self.segments:  # self.segments is a property of the base BinaryView class
+            if (
+                seg.start <= addr < seg.end
+            ):  # Check if the start of the read is within this segment
                 offset_in_segment = addr - seg.start
-                actual_length = length
-                if addr + length > seg.end:
-                    actual_length = seg.end - addr
-                    # self.log.log_debug(f"  Read truncated to segment end: NewLength=0x{actual_length:x}")
 
-                if actual_length <= 0:
+                readable_length_in_segment = seg.end - addr
+                actual_length_to_read = min(length, readable_length_in_segment)
+
+                if actual_length_to_read <= 0:
                     return b""
 
                 file_addr = seg.data_offset + offset_in_segment
 
-                # ensure read is within the segment's backing data from file
-                if offset_in_segment + actual_length > seg.data_length:
-                    # self.log.log_debug(f"  Read (VA 0x{addr:x}) extends beyond segment's file backing (FileOffset 0x{file_addr:x}, SegDataLen 0x{seg.data_length:x}).")
+                if offset_in_segment + actual_length_to_read > seg.data_length:
                     available_from_backing = seg.data_length - offset_in_segment
                     if available_from_backing <= 0:
-                        # self.log.log_debug(f"  No data available from backing for this part of segment.")
-                        return b""  # trying to read part of segment not backed by file data
-                    actual_length = available_from_backing
-                    # self.log.log_debug(f"  Adjusted read length from backing: 0x{actual_length:x}")
+                        return b""
+                    actual_length_to_read = available_from_backing
 
-                if actual_length <= 0:
+                if actual_length_to_read <= 0:
                     return b""
 
                 try:
-                    # self.log.log_debug(f"  Reading from raw_data: FileOffset=0x{file_addr:x}, ActualLength=0x{actual_length:x}")
-                    return self.raw_data.read(file_addr, actual_length)
+                    return self.raw_data.read(file_addr, actual_length_to_read)
                 except Exception as e:
                     self.log.log_error(
-                        f"Error in perform_read from raw_data at file offset 0x{file_addr:x}: {e}"
+                        f"Error in perform_read from raw_data at file offset 0x{file_addr:x} for {actual_length_to_read} bytes: {e}"
                     )
-                    return None
-        # self.log.log_debug(f"perform_read: No segment contains VA 0x{addr:x}.")
-        return None
-
-MinidumpView.register()
+                    return None  # Indicates a read error
+        return None  # Address not mapped in any segment
