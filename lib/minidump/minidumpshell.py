@@ -1,7 +1,7 @@
 
 import cmd
-from minidump.minidumpfile import *
-from minidump.common_structs import hexdump
+from .minidumpfile import *
+from .common_structs import hexdump
 
 def args2int(x):
 	if isinstance(x, int):

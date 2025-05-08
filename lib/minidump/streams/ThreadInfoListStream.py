@@ -5,7 +5,7 @@
 #
 import io
 import enum
-from minidump.common_structs import *
+from ..common_structs import *
 
 # https://msdn.microsoft.com/en-us/library/windows/desktop/ms680510(v=vs.85).aspx
 class DumpFlags(enum.Enum):

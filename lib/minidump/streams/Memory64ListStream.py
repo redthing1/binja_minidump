@@ -4,7 +4,7 @@
 #  Tamas Jos (@skelsec)
 #
 import io
-from minidump.common_structs import *
+from ..common_structs import *
 from typing import List
 
 # https://msdn.microsoft.com/en-us/library/windows/desktop/ms680387(v=vs.85).aspx

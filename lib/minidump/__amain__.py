@@ -6,9 +6,9 @@
 
 import logging
 import asyncio
-from minidump.aminidumpfile import AMinidumpFile
-from minidump.common_structs import hexdump
-from minidump._version import __banner__
+from .aminidumpfile import AMinidumpFile
+from .common_structs import hexdump
+from ._version import __banner__
 
 async def run():
 	import argparse

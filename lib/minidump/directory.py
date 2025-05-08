@@ -1,6 +1,6 @@
 
-from minidump.constants import MINIDUMP_STREAM_TYPE
-from minidump.common_structs import MINIDUMP_LOCATION_DESCRIPTOR
+from .constants import MINIDUMP_STREAM_TYPE
+from .common_structs import MINIDUMP_LOCATION_DESCRIPTOR
 
 class MINIDUMP_DIRECTORY:
 	def __init__(self):

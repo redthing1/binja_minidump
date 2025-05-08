@@ -4,7 +4,7 @@
 #  Tamas Jos (@skelsec)
 #
 import io
-from minidump.common_structs import *
+from ..common_structs import *
 
 class MinidumpModule:
 	def __init__(self):

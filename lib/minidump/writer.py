@@ -1,19 +1,19 @@
-from minidump.constants import MINIDUMP_STREAM_TYPE, MINIDUMP_TYPE
-from minidump.header import MinidumpHeader
-from minidump.common_structs import MINIDUMP_LOCATION_DESCRIPTOR
+from .constants import MINIDUMP_STREAM_TYPE, MINIDUMP_TYPE
+from .header import MinidumpHeader
+from .common_structs import MINIDUMP_LOCATION_DESCRIPTOR
 
-from minidump.utils.winapi.version import GetSystemInfo, GetVersionExW
-from minidump.utils.winapi.kernel32 import OpenProcess, PROCESS_ALL_ACCESS, VirtualQueryEx, ReadProcessMemory
-from minidump.utils.winapi.psapi import EnumProcessModules, GetModuleInformation, GetModuleFileNameExW
-from minidump.utils.winapi.version import GetFileVersionInfoW
-from minidump.streams import MINIDUMP_SYSTEM_INFO, PROCESSOR_ARCHITECTURE, MINIDUMP_MODULE_LIST, \
+from .utils.winapi.version import GetSystemInfo, GetVersionExW
+from .utils.winapi.kernel32 import OpenProcess, PROCESS_ALL_ACCESS, VirtualQueryEx, ReadProcessMemory
+from .utils.winapi.psapi import EnumProcessModules, GetModuleInformation, GetModuleFileNameExW
+from .utils.winapi.version import GetFileVersionInfoW
+from .streams import MINIDUMP_SYSTEM_INFO, PROCESSOR_ARCHITECTURE, MINIDUMP_MODULE_LIST, \
 	MINIDUMP_MODULE, VS_FIXEDFILEINFO, MINIDUMP_MEMORY_INFO_LIST, MINIDUMP_MEMORY_INFO, \
 	AllocationProtect, MemoryType, MemoryState, \
 	MINIDUMP_MEMORY64_LIST, MINIDUMP_MEMORY_DESCRIPTOR64
 
-from minidump.streams.SystemInfoStream import PROCESSOR_ARCHITECTURE, PRODUCT_TYPE
+from .streams.SystemInfoStream import PROCESSOR_ARCHITECTURE, PRODUCT_TYPE
 
-from minidump.directory import MINIDUMP_DIRECTORY
+from .directory import MINIDUMP_DIRECTORY
 
 import io
 

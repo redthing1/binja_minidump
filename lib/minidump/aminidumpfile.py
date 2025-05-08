@@ -10,12 +10,12 @@ import enum
 import struct
 import logging
 
-from minidump.header import MinidumpHeader
-from minidump.aminidumpreader import AMinidumpFileReader
-from minidump.streams import *
-from minidump.common_structs import *
-from minidump.constants import MINIDUMP_STREAM_TYPE
-from minidump.directory import MINIDUMP_DIRECTORY
+from .header import MinidumpHeader
+from .aminidumpreader import AMinidumpFileReader
+from .streams import *
+from .common_structs import *
+from .constants import MINIDUMP_STREAM_TYPE
+from .directory import MINIDUMP_DIRECTORY
 
 
 class AsyncFile:

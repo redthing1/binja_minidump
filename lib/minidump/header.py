@@ -1,5 +1,5 @@
-from minidump.constants import MINIDUMP_TYPE
-from minidump.exceptions import MinidumpHeaderFlagsException, MinidumpHeaderSignatureMismatchException
+from .constants import MINIDUMP_TYPE
+from .exceptions import MinidumpHeaderFlagsException, MinidumpHeaderSignatureMismatchException
 import io
 
 # https://msdn.microsoft.com/en-us/library/windows/desktop/ms680378(v=vs.85).aspx

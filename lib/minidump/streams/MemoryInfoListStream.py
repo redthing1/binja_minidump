@@ -5,7 +5,7 @@
 #
 import io
 import enum
-from minidump.common_structs import *
+from ..common_structs import *
 
 class AllocationProtect(enum.Enum):
 	NONE = 0

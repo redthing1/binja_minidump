@@ -5,7 +5,7 @@
 #
 import io
 import enum
-from minidump.common_structs import *
+from ..common_structs import *
 from typing import List
 
 # https://msdn.microsoft.com/en-us/library/windows/desktop/ms680372(v=vs.85).aspx

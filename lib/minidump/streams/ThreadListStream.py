@@ -4,8 +4,8 @@
 #  Tamas Jos (@skelsec)
 #
 import io
-from minidump.common_structs import *
-from minidump.streams.MemoryListStream import MINIDUMP_MEMORY_DESCRIPTOR
+from ..common_structs import *
+from ..streams.MemoryListStream import MINIDUMP_MEMORY_DESCRIPTOR
 
 # https://msdn.microsoft.com/en-us/library/windows/desktop/ms680515(v=vs.85).aspx
 class MINIDUMP_THREAD_LIST:

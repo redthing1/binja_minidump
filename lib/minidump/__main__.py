@@ -5,10 +5,10 @@
 #
 
 import logging
-from minidump.minidumpfile import MinidumpFile
-from minidump.common_structs import hexdump
-from minidump.minidumpshell import MinidumpShell
-from minidump._version import __banner__
+from .minidumpfile import MinidumpFile
+from .common_structs import hexdump
+from .minidumpshell import MinidumpShell
+from ._version import __banner__
 
 
 def run():

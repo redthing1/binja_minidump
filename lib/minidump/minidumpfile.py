@@ -11,14 +11,14 @@ import struct
 import logging
 from typing import List
 
-from minidump.header import MinidumpHeader
-from minidump.minidumpreader import MinidumpFileReader
-from minidump.streams import *
-from minidump.common_structs import *
-from minidump.constants import MINIDUMP_STREAM_TYPE
-from minidump.directory import MINIDUMP_DIRECTORY
-from minidump.streams.SystemInfoStream import PROCESSOR_ARCHITECTURE
-from minidump.structures.peb import PEB
+from .header import MinidumpHeader
+from .minidumpreader import MinidumpFileReader
+from .streams import *
+from .common_structs import *
+from .constants import MINIDUMP_STREAM_TYPE
+from .directory import MINIDUMP_DIRECTORY
+from .streams.SystemInfoStream import PROCESSOR_ARCHITECTURE
+from .structures.peb import PEB
 
 
 class MinidumpFile:

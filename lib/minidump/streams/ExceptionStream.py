@@ -8,7 +8,7 @@
 import io
 import enum
 from typing import List
-from minidump.common_structs import *
+from ..common_structs import *
 
 # https://msdn.microsoft.com/en-us/library/windows/desktop/ms680368(v=vs.85).aspx
 class MINIDUMP_EXCEPTION_STREAM:

@@ -1,5 +1,5 @@
 
-from minidump.utils.winapi.defines import *
+from .utils.winapi.defines import *
 
 
 # typedef struct _MODULEINFO {

@@ -1,4 +1,4 @@
-from minidump.utils.winapi.defines import *
+from .utils.winapi.defines import *
 import enum
 
 

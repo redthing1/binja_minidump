@@ -4,7 +4,7 @@
 #  Tamas Jos (@skelsec)
 #
 import io
-from minidump.common_structs import *
+from ..common_structs import *
 
 # https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_memory_list
 class MINIDUMP_MEMORY_LIST:

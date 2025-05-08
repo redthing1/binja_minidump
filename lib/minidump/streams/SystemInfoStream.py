@@ -7,7 +7,7 @@
 import io
 import enum
 import logging
-from minidump.common_structs import *
+from ..common_structs import *
 
 MINIDUMP_WIN_BUILDNO_TO_VERSION = {
 	103: 'Windows 3.1',

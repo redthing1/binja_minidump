@@ -5,7 +5,7 @@
 #
 
 import io
-from minidump.common_structs import *
+from ..common_structs import *
 
 # https://msdn.microsoft.com/en-us/library/windows/desktop/ms680521(v=vs.85).aspx
 class MINIDUMP_UNLOADED_MODULE_LIST:

@@ -1,4 +1,4 @@
-from minidump.streams.SystemInfoStream import PROCESSOR_ARCHITECTURE
+from ..streams.SystemInfoStream import PROCESSOR_ARCHITECTURE
 
 
 PEB_OFFSETS = [
