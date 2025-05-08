@@ -5,6 +5,7 @@
 import io
 import traceback  # for detailed error logging
 import datetime  # for timestamp conversion
+from typing import Optional, Tuple  # for type hinting
 
 # binary ninja api imports
 from binaryninja import (
@@ -65,7 +66,8 @@ except ImportError as e:
 class MinidumpView(BinaryView):
     """
     binaryview for windows minidump files, using the python-minidump library.
-    parses the dump, maps memory, identifies modules/threads, etc.
+    parses the dump, maps memory, identifies modules/threads, etc., adding
+    annotations like comments, symbols, and tags where appropriate.
     """
 
     name = "Minidump"  # distinguish from other potential loaders
@@ -78,7 +80,7 @@ class MinidumpView(BinaryView):
     # --- Registration and Validation ---
     @classmethod
     def is_valid_for_data(cls, data: BinaryView) -> bool:
-        """checks for the 'MDMP' signature."""
+        """checks for the 'MDMP' signature at the beginning of the file."""
         if data.length < 4:
             return False
         magic = data.read(0, 4)
@@ -94,14 +96,14 @@ class MinidumpView(BinaryView):
         self.log: Logger = self.create_logger("Minidump")  # tagged logger
 
         # this will hold the parsed minidump object from the library
-        self.mdmp: MinidumpFile | None = None
+        self.mdmp: Optional[MinidumpFile] = None
 
         # internal state populated during init
         self._address_size: int = 8  # default, updated from systeminfo
         self._endianness: Endianness = Endianness.LittleEndian
-        self._platform: Platform | None = None
-        self._arch: Architecture | None = None
-        self._crash_tag_type: TagType | None = None
+        self._platform: Optional[Platform] = None
+        self._arch: Optional[Architecture] = None
+        self._crash_tag_type: Optional[TagType] = None
         self._min_virtual_address: int = 0xFFFFFFFFFFFFFFFF
         self._max_virtual_address: int = 0
         self._entry_point_to_set: int = 0  # track intended entry point
@@ -127,18 +129,18 @@ class MinidumpView(BinaryView):
             self.CRASH_TAG_TYPE_NAME, self.CRASH_TAG_ICON
         )
 
-        # step 3: process the parsed streams
+        # step 3: process the parsed streams in a logical order
         self._process_system_info()
-        self._process_memory_info_list()  # caches protections
-        self._process_memory_segments()
-        self._process_module_list()
-        self._process_unloaded_module_list()
-        self._process_thread_list()
-        self._process_exception_stream()  # may update entry point
-        self._process_handle_data_stream()
-        self._process_misc_info()
+        self._process_memory_info_list()  # caches protections first
+        self._process_memory_segments()  # map memory based on lists and protections
+        self._process_module_list()  # define modules/sections
+        self._process_unloaded_module_list()  # log unloaded modules
+        self._process_thread_list()  # add thread info (stacks, context location)
+        self._process_exception_stream()  # check for crash info, potentially set entry point
+        self._process_handle_data_stream()  # log handle info
+        self._process_misc_info()  # log process times, pid etc.
 
-        # step 4: finalize bn view setup (sets entry point)
+        # step 4: finalize bn view setup (sets the final entry point)
         self._finalize_view_setup()
 
         self.log.log_info("Minidump initialization complete.")
@@ -155,7 +157,7 @@ class MinidumpView(BinaryView):
             # use the library's parse_buff method
             self.mdmp = MinidumpFile.parse_buff(file_like_object)
             self.log.log_info("python-minidump parsing successful.")
-            if self.mdmp.header:
+            if self.mdmp and self.mdmp.header:
                 self.log.log_debug(
                     f"  Parsed Header: Streams={self.mdmp.header.NumberOfStreams}, Flags=0x{self.mdmp.header.Flags:016x}"
                 )
@@ -550,7 +552,6 @@ class MinidumpView(BinaryView):
         for i, thread_entry in enumerate(self.mdmp.threads.threads):
             try:
                 # check attributes from MINIDUMP_THREAD and nested structures
-                # Corrected check: MemoryLocation is nested inside Stack
                 if (
                     not hasattr(thread_entry, "ThreadId")
                     or not hasattr(thread_entry, "Stack")
@@ -580,6 +581,12 @@ class MinidumpView(BinaryView):
                 self.define_auto_symbol(
                     Symbol(SymbolType.DataSymbol, stack_va, f"Thread_{tid}_StackBase")
                 )
+                # Add symbol for TEB if it's within mapped memory (optional)
+                if self.get_segment_at(teb):
+                    self.define_auto_symbol(
+                        Symbol(SymbolType.DataSymbol, teb, f"Thread_{tid}_TEB")
+                    )
+
                 context_loc = (
                     thread_entry.ThreadContext
                 )  # This is MINIDUMP_LOCATION_DESCRIPTOR
