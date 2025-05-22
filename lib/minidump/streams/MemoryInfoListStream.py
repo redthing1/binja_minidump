@@ -7,7 +7,7 @@ import io
 import enum
 from ..common_structs import *
 
-class AllocationProtect(enum.Enum):
+class AllocationProtect(enum.Flag):
 	NONE = 0
 	PAGE_EXECUTE = 0x10 #Enables execute access to the committed region of pages. An attempt to write to the committed region results in an access violation.
 						#This flag is not supported by the CreateFileMapping function.
